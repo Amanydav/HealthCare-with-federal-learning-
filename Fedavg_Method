@@ -1,265 +1,160 @@
-"""
-Federated Learning Simulation Script (Local Dataset Version) - FIXED
-Implements: FedAvg, FedProx, FedAdam, FedAdagrad
-
-Features:
- - Works directly with your local CSV dataset (e.g. Heart Disease, Diabetes, etc.)
- - Supports IID and Non-IID client data splits
- - Compares multiple federated learning aggregation methods
-
-Dependencies:
-    pip install tensorflow numpy scikit-learn pandas
-"""
-
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import matplotlib.pyplot as plt
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
 
 # ------------------------- CONFIG -------------------------
-# 👇 Change this path to your local dataset
-dataset_path = r"/content/diabetes.csv"
-target_col = "Outcome" # change if your dataset has a different target column name
+dataset_path = r"/content/drive/MyDrive/diabetes.csv"
+target_col = "Outcome"
 
 num_clients = 3
-rounds = 20
-local_epochs = 1
-local_lr = 0.01
-server_lr = 1.0
-method = 'fedavg'      # fedavg | fedprox | fedadam | fedadagrad
-mu = 0.01
-non_iid = False
+rounds = 30
+local_epochs = 5
+local_lr = 0.001
 random_state = 42
 
-# ------------------------- Utilities -------------------------
+# ------------------------- Model -------------------------
 def create_model(input_dim):
-    model = tf.keras.Sequential([
-        tf.keras.layers.InputLayer(input_shape=(input_dim,)),
-        tf.keras.layers.Dense(64, activation='relu'),
+    model = tf.kerasSequential = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(input_dim,)),
+        tf.keras.layers.Dense(128, activation="relu"),
         tf.keras.layers.Dropout(0.3),
-        tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(1, activation='sigmoid')
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(1, activation="sigmoid")
     ])
     return model
 
-
+# ------------------------- Weight Utilities -------------------------
 def get_weights_vector(weights):
-    """Flatten a list of numpy arrays (weights) into a single 1D numpy vector."""
     return np.concatenate([w.flatten() for w in weights])
 
-
 def set_weights_from_vector(model, vec, template_weights):
-    """Set model weights from a flat vector using template_weights shapes."""
-    new_weights = []
-    idx = 0
+    new_weights, idx = [], 0
     for w in template_weights:
-        shape = w.shape
-        size = np.prod(shape)
-        new_w = vec[idx: idx + size].reshape(shape)
-        new_weights.append(new_w)
+        size = np.prod(w.shape)
+        new_weights.append(vec[idx:idx + size].reshape(w.shape))
         idx += size
     model.set_weights(new_weights)
 
-
 # ------------------------- Dataset -------------------------
-def load_custom_data(csv_path, target_col='target', test_size=0.2, random_state=42):
-    """Load dataset from csv_path. target_col must exist in CSV."""
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"CSV file not found at path: {csv_path}")
-    except Exception as e:
-        raise RuntimeError(f"Error reading CSV: {e}")
+def load_data(csv_path, target_col):
+    df = pd.read_csv(csv_path)
 
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in dataset. Available columns: {list(df.columns)}")
-
-    # Features and labels
     X = df.drop(columns=[target_col]).values
-    y = df[target_col].values
-
-    # Ensure y is numeric (0/1) for binary classification
-    if not np.issubdtype(y.dtype, np.number):
-        # Try to map common text labels to 0/1
-        unique = np.unique(y)
-        if len(unique) == 2:
-            mapping = {unique[0]: 0, unique[1]: 1}
-            y = np.vectorize(mapping.get)(y)
-        else:
-            raise ValueError("Target column must be binary (numeric) for this script.")
+    y = df[target_col].values.astype(np.int32)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=random_state
+        X, y, test_size=0.2, stratify=y, random_state=random_state
     )
 
-    scaler = StandardScaler().fit(X_train)
-    X_train = scaler.transform(X_train).astype(np.float32)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train).astype(np.float32)
     X_test = scaler.transform(X_test).astype(np.float32)
-    y_train = y_train.astype(np.float32)
-    y_test = y_test.astype(np.float32)
 
     return X_train, X_test, y_train, y_test
 
-
+# ------------------------- IID Client Split -------------------------
 def split_data_iid(X, y, num_clients):
-    data_per_client = len(X) // num_clients
-    clients = []
-    idx = 0
-    for i in range(num_clients):
-        if i == num_clients - 1:
-            Xc = X[idx:]
-            yc = y[idx:]
-        else:
-            Xc = X[idx: idx + data_per_client]
-            yc = y[idx: idx + data_per_client]
-        clients.append((Xc, yc))
-        idx += data_per_client
-    return clients
-
-
-def split_data_non_iid(X, y, num_clients, num_shards=2):
-    idxs = np.argsort(y)
-    Xs = X[idxs]
-    ys = y[idxs]
-    shards = np.array_split(np.arange(len(X)), num_clients * num_shards)
-    clients = [[] for _ in range(num_clients)]
-    for i, shard in enumerate(shards):
-        client_id = i % num_clients
-        clients[client_id].append(shard)
-    client_data = []
-    for shards_for_client in clients:
-        indices = np.concatenate(shards_for_client)
-        client_data.append((Xs[indices], ys[indices]))
-    return client_data
-
+    idxs = np.random.permutation(len(X))
+    X, y = X[idxs], y[idxs]
+    splits = np.array_split(np.arange(len(X)), num_clients)
+    return [(X[s], y[s]) for s in splits]
 
 # ------------------------- Local Training -------------------------
-def local_train_prox(model, global_weights, X, y, epochs=1, batch_size=32, lr=0.01, mu=0.01):
-    optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
-    loss_fn = tf.keras.losses.BinaryCrossentropy()
-    train_dataset = tf.data.Dataset.from_tensor_slices((X, y)).shuffle(100, seed=random_state).batch(batch_size)
-    global_vars = [tf.convert_to_tensor(w) for w in global_weights]
+def local_train(model, X, y):
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=local_lr),
+        loss="binary_crossentropy"
+    )
 
-    for epoch in range(epochs):
-        for bx, by in train_dataset:
-            with tf.GradientTape() as tape:
-                preds = model(bx, training=True)
-                loss = loss_fn(by, preds)
-                prox = 0.0
-                for var, gvar in zip(model.trainable_variables, global_vars):
-                    prox += tf.nn.l2_loss(var - gvar)
-                loss += (mu / 2.0) * prox
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    model.fit(
+        X, y,
+        epochs=local_epochs,
+        batch_size=32,
+        class_weight={0: 1.0, 1: 2.0},
+        verbose=0
+    )
     return model.get_weights()
 
-
-def local_train_standard(model, X, y, epochs=1, batch_size=32, lr=0.01):
-    model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=lr),
-                  loss='binary_crossentropy',
-                  metrics=['accuracy'])
-    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
-    return model.get_weights()
-
-
-# ------------------------- Server Aggregation -------------------------
-def aggregate_fedavg(weight_list, weights_sizes):
-    total = sum(weights_sizes)
-    agg = np.zeros_like(weight_list[0])
-    for w, size in zip(weight_list, weights_sizes):
-        agg += (size / total) * w
+# ------------------------- FedAvg -------------------------
+def aggregate_fedavg(weight_vectors, sizes):
+    total = sum(sizes)
+    agg = np.zeros_like(weight_vectors[0])
+    for w, s in zip(weight_vectors, sizes):
+        agg += (s / total) * w
     return agg
 
-
-def server_update_fedadam(global_vec, agg_vec, state, server_lr=1.0, beta1=0.9, beta2=0.999, eps=1e-8):
-    delta = agg_vec - global_vec
-    state['m'] = beta1 * state['m'] + (1 - beta1) * delta
-    state['v'] = beta2 * state['v'] + (1 - beta2) * (delta * delta)
-    # bias correction
-    m_hat = state['m'] / (1 - beta1 ** (state['t'] + 1))
-    v_hat = state['v'] / (1 - beta2 ** (state['t'] + 1))
-    update = server_lr * m_hat / (np.sqrt(v_hat) + eps)
-    new_global = global_vec + update
-    state['t'] += 1
-    return new_global, state
-
-
-def server_update_fedadagrad(global_vec, agg_vec, state, server_lr=1.0, eps=1e-8):
-    delta = agg_vec - global_vec
-    state['v'] = state['v'] + (delta * delta)
-    state['m'] = delta
-    update = server_lr * state['m'] / (np.sqrt(state['v']) + eps)
-    new_global = global_vec + update
-    return new_global, state
-
-
 # ------------------------- Evaluation -------------------------
-def evaluate_global(model_template, global_vec, template_weights, X_test, y_test):
-    set_weights_from_vector(model_template, global_vec, template_weights)
-    model_template.compile(optimizer='sgd', loss='binary_crossentropy', metrics=['accuracy'])
-    loss, acc = model_template.evaluate(X_test, y_test, verbose=0)
-    return acc
+def evaluate(model, global_vec, template_weights, X_test, y_test):
+    set_weights_from_vector(model, global_vec, template_weights)
 
+    y_pred = (model.predict(X_test, verbose=0) >= 0.5).astype(int).reshape(-1)
 
-# ------------------------- Main Simulation -------------------------
-def simulate():
-    X_train, X_test, y_train, y_test = load_custom_data(dataset_path, target_col=target_col,
-                                                        test_size=0.2, random_state=random_state)
+    return (
+        accuracy_score(y_test, y_pred),
+        precision_score(y_test, y_pred, zero_division=0),
+        recall_score(y_test, y_pred, zero_division=0),
+        f1_score(y_test, y_pred, zero_division=0),
+        confusion_matrix(y_test, y_pred)
+    )
 
-    if non_iid:
-        clients = split_data_non_iid(X_train, y_train, num_clients)
-    else:
-        clients = split_data_iid(X_train, y_train, num_clients)
+# ------------------------- Simulation -------------------------
+def simulate_fedavg():
+    X_train, X_test, y_train, y_test = load_data(dataset_path, target_col)
+    clients = split_data_iid(X_train, y_train, num_clients)
 
     input_dim = X_train.shape[1]
-    template_model = create_model(input_dim)
-    initial_weights = template_model.get_weights()
-    template_vec = get_weights_vector(initial_weights)
+    template_weights = create_model(input_dim).get_weights()
+    global_vec = get_weights_vector(template_weights)
 
-    global_vec = template_vec.copy()
-    template_shapes = initial_weights
-    server_state = {'m': np.zeros_like(global_vec), 'v': np.zeros_like(global_vec), 't': 0}
+    acc_hist = []
+    final_metrics = None
 
-    history = []
-    for r in range(rounds):
-        client_vecs = []
-        client_sizes = []
+    for _ in range(rounds):
+        client_vecs, client_sizes = [], []
+
         for Xc, yc in clients:
             local_model = create_model(input_dim)
-            set_weights_from_vector(local_model, global_vec, template_shapes)
-            if method.lower() == 'fedprox':
-                new_weights = local_train_prox(local_model, [tf.convert_to_tensor(w) for w in template_shapes],
-                                               Xc, yc, epochs=local_epochs, lr=local_lr, mu=mu)
-            else:
-                new_weights = local_train_standard(local_model, Xc, yc, epochs=local_epochs, lr=local_lr)
-            vec = get_weights_vector(new_weights)
-            client_vecs.append(vec)
+            set_weights_from_vector(local_model, global_vec, template_weights)
+
+            new_weights = local_train(local_model, Xc, yc)
+            client_vecs.append(get_weights_vector(new_weights))
             client_sizes.append(len(Xc))
 
-        # Aggregate
-        agg_vec = aggregate_fedavg(client_vecs, client_sizes)
+        global_vec = aggregate_fedavg(client_vecs, client_sizes)
 
-        # Server update
-        if method.lower() == 'fedavg':
-            global_vec = agg_vec
-        elif method.lower() == 'fedadam':
-            global_vec, server_state = server_update_fedadam(global_vec, agg_vec, server_state, server_lr=server_lr)
-        elif method.lower() == 'fedadagrad':
-            server_state['m'] = agg_vec - global_vec
-            global_vec, server_state = server_update_fedadagrad(global_vec, agg_vec, server_state, server_lr=server_lr)
-        elif method.lower() == 'fedprox':
-            global_vec = agg_vec
-        else:
-            raise ValueError(f"Unknown method: {method}")
+        final_metrics = evaluate(
+            create_model(input_dim),
+            global_vec,
+            template_weights,
+            X_test,
+            y_test
+        )
+        acc_hist.append(final_metrics[0])
 
-        acc = evaluate_global(create_model(input_dim), global_vec, template_shapes, X_test, y_test)
-        history.append(acc)
-        print(f"Round {r+1}/{rounds} - Method={method.upper()} - Test Accuracy={acc:.4f}")
+    acc, prec, rec, f1, cm = final_metrics
 
-    print(f"Final Accuracy ({method.upper()}): {history[-1]:.4f}")
-    return history
+    print("\n==========  FEDAVG (BEST DECENTRALIZED RESULTS) ==========")
+    print(f"Accuracy  : {acc:.4f}")
+    print(f"Precision : {prec:.4f}")
+    print(f"Recall    : {rec:.4f}")
+    print(f"F1 Score  : {f1:.4f}")
+    print("Confusion Matrix:")
+    print(cm)
 
+    plt.plot(range(1, rounds + 1), acc_hist)
+    plt.xlabel("Communication Rounds")
+    plt.ylabel("Accuracy")
+    plt.title("IID FedAvg Accuracy (Upper Bound)")
+    plt.grid(True)
+    plt.show()
 
+# ------------------------- Run -------------------------
 if __name__ == "__main__":
-    simulate()
+    simulate_fedavg()
