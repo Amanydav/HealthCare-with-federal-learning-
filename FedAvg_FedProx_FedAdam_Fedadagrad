@@ -1,0 +1,241 @@
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from copy import deepcopy
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+)
+
+# -------------------- CONFIG --------------------
+dataset_path = "/content/drive/MyDrive/diabetes.csv"  # change as needed
+target_col = "Outcome"
+
+num_clients = 3
+rounds = 30
+local_epochs = 5
+local_lr = 0.001
+server_lr = 1.0
+random_state = 42
+class_weight = {0: 1.0, 1: 2.0}  # adjustable
+
+mu = 0.01  # FedProx proximal term
+algorithms = ["fedavg", "fedprox", "fedadam", "fedadagrad"]
+
+# -------------------- MODEL --------------------
+def create_model(input_dim):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(input_dim,)),
+        tf.keras.layers.Dense(128, activation="relu"),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(64, activation="relu"),
+        tf.keras.layers.Dense(1, activation="sigmoid")
+    ])
+    return model
+
+# -------------------- WEIGHT UTILS --------------------
+def get_weights_vector(weights):
+    """Flatten list of numpy arrays to 1D numpy vector."""
+    return np.concatenate([w.flatten() for w in weights])
+
+def set_weights_from_vector(model, vec, template_weights):
+    """Set model weights from flattened vector using template weights shapes."""
+    new_weights = []
+    idx = 0
+    for w in template_weights:
+        shape = w.shape
+        size = np.prod(shape)
+        new_w = vec[idx: idx + size].reshape(shape)
+        new_weights.append(new_w)
+        idx += size
+    model.set_weights(new_weights)
+
+# -------------------- DATA --------------------
+def load_and_prepare(path, target):
+    df = pd.read_csv(path)
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in CSV.")
+    X = df.drop(columns=[target]).values
+    y = df[target].values.astype(np.int32)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=random_state
+    )
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train).astype(np.float32)
+    X_test = scaler.transform(X_test).astype(np.float32)
+
+    return X_train, X_test, y_train, y_test
+
+def split_data_iid(X, y, num_clients):
+    idx = np.random.RandomState(random_state).permutation(len(X))
+    splits = np.array_split(idx, num_clients)
+    return [(X[s], y[s]) for s in splits]
+
+# -------------------- LOCAL TRAINING --------------------
+def local_train_standard(model, X, y, epochs=local_epochs, lr=local_lr):
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        loss="binary_crossentropy"
+    )
+    # Early stopping could be used, but quiet training is fine for FL local steps
+    model.fit(X, y, epochs=epochs, batch_size=32, class_weight=class_weight, verbose=0)
+    return model.get_weights()
+
+def local_train_fedprox(model, global_weights, X, y, epochs=local_epochs, lr=local_lr, mu_val=mu):
+    # Use mini-batches to compute prox loss properly
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    loss_fn = tf.keras.losses.BinaryCrossentropy()
+    dataset = tf.data.Dataset.from_tensor_slices((X, y)).shuffle(100, seed=random_state).batch(32)
+
+    global_tensors = [tf.convert_to_tensor(w) for w in global_weights]
+
+    for _ in range(epochs):
+        for bx, by in dataset:
+            with tf.GradientTape() as tape:
+                preds = model(bx, training=True)
+                loss = loss_fn(by, preds)
+                prox = 0.0
+                for var, gvar in zip(model.trainable_variables, global_tensors):
+                    prox += tf.nn.l2_loss(var - gvar)
+                loss += (mu_val / 2.0) * prox
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return model.get_weights()
+
+# -------------------- AGGREGATION & SERVER UPDATES --------------------
+def aggregate_fedavg(weight_vectors, sizes):
+    total = sum(sizes)
+    agg = np.zeros_like(weight_vectors[0])
+    for w, s in zip(weight_vectors, sizes):
+        agg += (s / total) * w
+    return agg
+
+def server_update_fedadam(global_vec, agg_vec, state, lr=server_lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    delta = agg_vec - global_vec
+    state['m'] = beta1 * state['m'] + (1 - beta1) * delta
+    state['v'] = beta2 * state['v'] + (1 - beta2) * (delta * delta)
+    # bias correction
+    m_hat = state['m'] / (1 - beta1 ** (state['t'] + 1))
+    v_hat = state['v'] / (1 - beta2 ** (state['t'] + 1))
+    update = lr * m_hat / (np.sqrt(v_hat) + eps)
+    new_global = global_vec + update
+    state['t'] += 1
+    return new_global, state
+
+def server_update_fedadagrad(global_vec, agg_vec, state, lr=server_lr, eps=1e-8):
+    delta = agg_vec - global_vec
+    state['v'] = state['v'] + (delta * delta)
+    update = lr * delta / (np.sqrt(state['v']) + eps)
+    new_global = global_vec + update
+    return new_global, state
+
+# -------------------- EVALUATION --------------------
+def evaluate_global(model_template, global_vec, template_weights, X_test, y_test):
+    # load global weights into a fresh model and evaluate
+    set_weights_from_vector(model_template, global_vec, template_weights)
+    y_prob = model_template.predict(X_test, verbose=0).reshape(-1)
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    cm = confusion_matrix(y_test, y_pred)
+    return acc, prec, rec, f1, cm
+
+# -------------------- SIMULATION (single algorithm) --------------------
+def simulate_algorithm(algorithm_name, X_train, X_test, y_train, y_test):
+    clients = split_data_iid(X_train, y_train, num_clients)
+    input_dim = X_train.shape[1]
+    template_model = create_model(input_dim)
+    template_weights = template_model.get_weights()
+    global_vec = get_weights_vector(template_weights)
+
+    # server optimizer state for adaptive methods
+    server_state = {'m': np.zeros_like(global_vec), 'v': np.zeros_like(global_vec), 't': 0}
+
+    acc_history = []
+    final_metrics = None
+
+    for r in range(rounds):
+        client_vecs = []
+        client_sizes = []
+
+        for Xc, yc in clients:
+            local_model = create_model(input_dim)
+            set_weights_from_vector(local_model, global_vec, template_weights)
+
+            if algorithm_name == "fedprox":
+                new_weights = local_train_fedprox(local_model, template_weights, Xc, yc,
+                                                  epochs=local_epochs, lr=local_lr, mu_val=mu)
+            else:
+                # standard local training used by fedavg, fedadam, fedadagrad
+                new_weights = local_train_standard(local_model, Xc, yc, epochs=local_epochs, lr=local_lr)
+
+            client_vecs.append(get_weights_vector(new_weights))
+            client_sizes.append(len(Xc))
+
+        # aggregate (FedAvg base)
+        agg_vec = aggregate_fedavg(client_vecs, client_sizes)
+
+        # server update according to algorithm
+        if algorithm_name == "fedavg" or algorithm_name == "fedprox":
+            global_vec = agg_vec
+        elif algorithm_name == "fedadam":
+            global_vec, server_state = server_update_fedadam(global_vec, agg_vec, server_state, lr=server_lr)
+        elif algorithm_name == "fedadagrad":
+            global_vec, server_state = server_update_fedadagrad(global_vec, agg_vec, server_state, lr=server_lr)
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm_name}")
+
+        acc, prec, rec, f1, cm = evaluate_global(create_model(input_dim), global_vec, template_weights, X_test, y_test)
+        acc_history.append(acc)
+        final_metrics = (acc, prec, rec, f1, cm)
+        # don't print per-round metrics to keep output clean; store history
+
+    return acc_history, final_metrics
+
+# -------------------- RUN ALL ALGORITHMS & PLOT --------------------
+def run_all():
+    X_train, X_test, y_train, y_test = load_and_prepare(dataset_path, target_col)
+
+    results = {}
+    plt.figure(figsize=(9,6))
+
+    for alg in algorithms:
+        print(f"\nRunning: {alg.upper()} ...")
+        acc_hist, final_metrics = simulate_algorithm(alg, X_train, X_test, y_train, y_test)
+        results[alg] = {'acc_hist': acc_hist, 'metrics': final_metrics}
+
+        # plot accuracy curve
+        plt.plot(range(1, rounds+1), acc_hist, label=alg.upper())
+
+    # finalize plot
+    plt.xlabel("Communication Rounds")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy vs Rounds for FL Algorithms (IID)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # print final metrics per algorithm
+    for alg in algorithms:
+        acc, prec, rec, f1, cm = results[alg]['metrics']
+        print(f"\n===== FINAL RESULTS: {alg.upper()} =====")
+        print(f"Accuracy  : {acc:.4f}")
+        print(f"Precision : {prec:.4f}")
+        print(f"Recall    : {rec:.4f}")
+        print(f"F1 Score  : {f1:.4f}")
+        print("Confusion Matrix:")
+        print(cm)
+
+    return results
+
+if __name__ == "__main__":
+    all_results = run_all()
